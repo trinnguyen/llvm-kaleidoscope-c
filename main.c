@@ -481,5 +481,13 @@ static void run_lexer() {
 int main() {
     parse();
 
-    fprintf(stdout, "parse result: %d functions, %d externs, %d top level exprs", ast_function_idx, ast_extern_idx, ast_expr_idx);
+    fprintf(stdout, "parse result: %d functions, %d externs, %d top level exprs\n", ast_function_idx, ast_extern_idx, ast_expr_idx);
+
+    for (int i = 0; i < ast_function_idx; ++i) {
+        fprintf(stdout, "\tfunction: %s\n", gl_root_ast.functions[i]->proto->name);
+    }
+
+    for (int i = 0; i < ast_extern_idx; ++i) {
+        fprintf(stdout, "\texterns: %s\n", gl_root_ast.extern_protos[i]->name);
+    }
 }
