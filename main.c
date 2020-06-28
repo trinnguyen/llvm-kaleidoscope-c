@@ -3,6 +3,10 @@
 #include <ctype.h>
 #include <stdlib.h>
 
+#include <llvm-c/Core.h>
+#include <llvm-c/Analysis.h>
+#include "khash.h"
+
 // The lexer returns tokens [0-255] if it is an unknown character, otherwise one
 // of these for known things.
 typedef enum {
@@ -25,7 +29,7 @@ static double num_val;             // Filled in if tok_number
  * @return token
  */
 static Token gettok() {
-    static int last_char = ' ';
+    static int  last_char = ' ';
 
     // Skip any whitespace.
     while (isspace(last_char))
@@ -34,11 +38,13 @@ static Token gettok() {
     // identifiers and specific keywords: identifier: [a-zA-Z][a-zA-Z0-9]*
     if (isalpha(last_char)) {
         // reset
-        memset(identifier_str, 0, sizeof(identifier_str));
-        identifier_str[0] = 0;
+        size_t len = strlen(identifier_str);
+        for (size_t i = 0; i < len; ++i) {
+            identifier_str[i] = 0;
+        }
 
         // index
-        int idx = 0;
+        int  idx = 0;
         identifier_str[idx++] = (char)last_char;
 
         while (isalnum((last_char = getchar())))
@@ -56,7 +62,7 @@ static Token gettok() {
     // Number: [0-9.]+
     if (isdigit(last_char) || last_char == '.') {
         char num_str[64];
-        int idx = 0;
+        int  idx = 0;
         do {
             num_str[idx++] = (char)last_char;
             last_char = getchar();
@@ -81,7 +87,7 @@ static Token gettok() {
         return tok_eof;
 
     // Otherwise, just return the character as its ascii value.
-    int this_char = last_char;
+    int  this_char = last_char;
     last_char = getchar();
     return this_char;
 }
@@ -105,12 +111,13 @@ typedef struct {
 typedef struct {
     char callee[256];
     expr_ast *args[64];
+    int args_len;
 } call_expr_ast;
 
 typedef struct {
     char name[256];
     char args[256][64];
-
+    int args_len;
 } prototype_ast;
 
 typedef struct {
@@ -135,22 +142,36 @@ struct expr_ast{
     };
 };
 
+typedef enum {
+    top_node_type_func = -1,
+    top_node_type_expr = -2,
+    top_node_type_extern = -3,
+} top_node_type;
+
 typedef struct {
-    prototype_ast *extern_protos[64];
-    function_ast *functions[64];
-    function_ast *top_exprs[64];
+    top_node_type type;
+    union {
+        prototype_ast *extern_proto;
+        function_ast *function;
+        function_ast *expr;
+    };
+} top_node;
+
+typedef struct {
+    top_node nodes[64];
+    int  nodes_len;
 } root_ast;
 
 static root_ast gl_root_ast = {};
-static int ast_function_idx = 0;
-static int ast_extern_idx = 0;
-static int ast_expr_idx = 0;
 
-static int cur_tok;
-static int get_next_token() {
+static int  cur_tok;
+static int  get_next_token() {
     cur_tok = gettok();
-    fprintf(stdout, "\tnext token %d\n", cur_tok);
     return cur_tok;
+}
+
+static void log_info(const char *str) {
+    fprintf(stdout, "info: %s\n", str);
 }
 
 static void log_error(const char *str) {
@@ -159,10 +180,9 @@ static void log_error(const char *str) {
 
 // numberexpr ::= number
 static expr_ast *parse_number_expr() {
-    expr_ast *res = &(expr_ast){
-            .type = expr_ast_type_num,
-            .number_val = num_val
-    };
+    expr_ast *res = malloc(sizeof(expr_ast));
+    res->type = expr_ast_type_num;
+    res->number_val = num_val;
     get_next_token();
     return res;
 }
@@ -170,7 +190,8 @@ static expr_ast *parse_number_expr() {
 static struct expr_ast *parse_expression();
 
 static expr_ast *parse_identifier_func_call() {
-    expr_ast *var = &(expr_ast){.type = expr_ast_type_var};
+    expr_ast *var = malloc(sizeof(expr_ast));
+    var->type = expr_ast_type_var;
     strcpy(var->variable.name, identifier_str);
 
     if (get_next_token() != '(') {
@@ -178,10 +199,11 @@ static expr_ast *parse_identifier_func_call() {
     }
 
     // check if function call
-    expr_ast *func_call = &(expr_ast){.type = expr_ast_type_function_call};
+    expr_ast *func_call = malloc(sizeof(expr_ast));
+    func_call->type = expr_ast_type_function_call;
     strcpy(func_call->call_expr.callee, identifier_str);
     get_next_token(); // consume (
-    int idx = 0;
+    func_call->call_expr.args_len = 0;
     if (cur_tok != ')') {
         while (1) {
             expr_ast *expr = parse_expression();
@@ -190,7 +212,7 @@ static expr_ast *parse_identifier_func_call() {
             }
 
             // append
-            func_call->call_expr.args[idx++] = expr;
+            func_call->call_expr.args[func_call->call_expr.args_len++] = expr;
 
             // finish
             if (cur_tok == ')')
@@ -241,12 +263,12 @@ static expr_ast *parse_primary() {
         case '(':
             return parse_parent_expr();
         default:
-            log_error("unknown token when expecting an expression");
+            fprintf(stderr, "unknown token when expecting an expression: %d\t", cur_tok);
             return NULL;
     }
 }
 
-static int get_tok_precedence() {
+static int  get_tok_precedence() {
     if (!isascii(cur_tok))
         return -1;
 
@@ -265,10 +287,10 @@ static int get_tok_precedence() {
     }
 }
 
-static expr_ast *parse_binop_rhs(int expr_prec, expr_ast* lhs) {
+static expr_ast *parse_binop_rhs(int  expr_prec, expr_ast* lhs) {
     // If this is a binop, find its precedence.
     while (1) {
-        int tok_prec = get_tok_precedence();
+        int  tok_prec = get_tok_precedence();
 
         // If this is a binop that binds at least as tightly as the current binop,
         // consume it, otherwise we are done.
@@ -276,7 +298,7 @@ static expr_ast *parse_binop_rhs(int expr_prec, expr_ast* lhs) {
             return lhs;
 
         // Okay, we know this is a binop.
-        int binop = cur_tok;
+        int  binop = cur_tok;
         get_next_token(); // eat binop
 
         // Parse the primary expression after the binary operator.
@@ -287,7 +309,7 @@ static expr_ast *parse_binop_rhs(int expr_prec, expr_ast* lhs) {
 
         // If BinOp binds less tightly with RHS than the operator after RHS, let
         // the pending operator take RHS as its LHS.
-        int next_prec = get_tok_precedence();
+        int  next_prec = get_tok_precedence();
         if (tok_prec < next_prec) {
             rhs = parse_binop_rhs(tok_prec + 1, rhs);
             if (rhs == NULL)
@@ -295,18 +317,18 @@ static expr_ast *parse_binop_rhs(int expr_prec, expr_ast* lhs) {
         }
 
         // Merge LHS/RHS.
-        return &(expr_ast){
-            .type = expr_ast_type_binary,
-            .binary_expr = (binary_expr_ast){
+        expr_ast *res = malloc(sizeof(expr_ast));
+        res->type = expr_ast_type_binary;
+        res->binary_expr = (binary_expr_ast){
                 .lhs = lhs,
                 .op = (char)binop,
                 .rhs = rhs
-            }
         };
+        return res;
     }
 }
 
-static int is_supported_binop() {
+static int  is_supported_binop() {
     return cur_tok == '+' || cur_tok == '-' || cur_tok == '*' || cur_tok == '/' || cur_tok == '>' || cur_tok == '<';
 }
 
@@ -333,7 +355,7 @@ static prototype_ast *parse_prototype() {
     }
 
     // name
-    prototype_ast *res = &(prototype_ast){};
+    prototype_ast *res = malloc(sizeof(prototype_ast));
     strcpy(res->name, identifier_str);
 
     // args
@@ -343,9 +365,8 @@ static prototype_ast *parse_prototype() {
     }
 
     // Read the list of argument names.
-    int idx = 0;
     while (get_next_token() == tok_identifier) {
-        strcpy(res->args[idx++], identifier_str);
+        strcpy(res->args[res->args_len++], identifier_str);
     }
 
     if (cur_tok != ')') {
@@ -369,7 +390,10 @@ static function_ast *parse_definition() {
     if (expr == NULL)
         return NULL;
 
-    return &((function_ast){.proto = proto, .body = expr});
+    function_ast *res = malloc(sizeof(function_ast));
+    res->proto = proto;
+    res->body = expr;
+    return res;
 }
 
 static prototype_ast *parse_extern() {
@@ -381,22 +405,29 @@ static prototype_ast *parse_extern() {
 }
 
 // toplevelexpr ::= expression
-// defining anonymous nullary (zero argument) functions for them
+// defining anonymous nullary (zero argument) function for them
 static function_ast *parse_top_level_expr() {
     expr_ast *expr = parse_expression();
     if (expr == NULL)
         return NULL;
 
-    prototype_ast *proto = &(prototype_ast){.name = ""};
-    function_ast *func = &(function_ast){.proto = proto, .body = expr};
+    prototype_ast *proto = malloc(sizeof(prototype_ast));
+    strcpy(proto->name, "__anon_expr");
+
+    function_ast *func = malloc(sizeof(function_ast));
+    func->proto = proto;
+    func->body = expr;
     return func;
 }
 
 static void handle_definition() {
     function_ast *ast = parse_definition();
     if (ast != NULL) {
-        gl_root_ast.functions[ast_function_idx++] = ast;
-        fprintf(stdout, "Parsed a function definition.\n");
+        gl_root_ast.nodes[gl_root_ast.nodes_len ++ ] = (top_node){
+                .type = top_node_type_func,
+                .function = ast
+        };
+        fprintf(stdout, "Parsed a function definition: %s.\n", ast->proto->name);
     } else {
         // Skip token for error recovery.
         get_next_token();
@@ -406,7 +437,10 @@ static void handle_definition() {
 static void handle_extern() {
     prototype_ast *ast = parse_extern();
     if (ast != NULL) {
-        gl_root_ast.extern_protos[ast_extern_idx++] = ast;
+        gl_root_ast.nodes[gl_root_ast.nodes_len ++ ] = (top_node){
+                .type = top_node_type_extern,
+                .extern_proto = ast
+        };
         fprintf(stdout, "Parsed an extern\n");
     } else {
         // Skip token for error recovery.
@@ -418,7 +452,10 @@ static void handle_top_level_expression() {
     // Evaluate a top-level expression into an anonymous function.
     function_ast *ast = parse_top_level_expr();
     if (ast != NULL) {
-        gl_root_ast.top_exprs[ast_expr_idx++] = ast;
+        gl_root_ast.nodes[gl_root_ast.nodes_len ++ ] = (top_node){
+                .type = top_node_type_expr,
+                .expr = ast
+        };
         fprintf(stdout, "Parsed a top-level expr\n");
     } else {
         // Skip token for error recovery.
@@ -450,7 +487,7 @@ static void parse() {
 }
 
 static void run_lexer() {
-    int stop = 0;
+    int  stop = 0;
     while (stop == 0) {
         Token token = gettok();
         switch (token) {
@@ -475,19 +512,234 @@ static void run_lexer() {
     }
 }
 
+static LLVMContextRef context;
+
+static LLVMModuleRef module;
+
+static LLVMBuilderRef builder;
+
+// hash table for name values
+KHASH_MAP_INIT_STR(str, LLVMValueRef);
+khash_t(str) *h;
+
+static LLVMValueRef code_gen_expr(expr_ast *expr);
+
+static LLVMValueRef code_gen_proto(prototype_ast *proto) {
+
+    int param_cnt = proto->args_len;
+
+    // set param types
+    LLVMTypeRef params[param_cnt];
+    for (int i = 0; i < param_cnt; i++) {
+        params[i] = LLVMDoubleTypeInContext(context);
+    }
+
+    // create function
+    LLVMTypeRef func_type = LLVMFunctionType(LLVMDoubleTypeInContext(context), params, param_cnt, 0);
+    LLVMValueRef func = LLVMAddFunction(module, proto->name, func_type);
+    LLVMSetLinkage(func, LLVMExternalLinkage);
+
+    // set param name
+    for (int i = 0; i < param_cnt; i++) {
+        LLVMValueRef param = LLVMGetParam(func, i);
+        LLVMSetValueName2(param, proto->args[i], strlen(proto->args[i]));
+    }
+
+    return func;
+}
+
+static LLVMValueRef code_gen_func(function_ast *ast) {
+
+    // First, check for an existing function from a previous 'extern' declaration.
+    LLVMValueRef func = LLVMGetNamedFunction(module, ast->proto->name);
+    if (func == NULL) {
+        func = code_gen_proto(ast->proto);
+    }
+
+    if (func == NULL) {
+        return NULL;
+    }
+
+    // Create a new basic block to start insertion into.
+    LLVMBasicBlockRef block = LLVMAppendBasicBlockInContext(context, func, "entry");
+    LLVMPositionBuilderAtEnd(builder, block);
+
+    // Record the function arguments in the NamedValues map.
+    kh_clear_str(h);
+    for (int i = 0; i < ast->proto->args_len; ++i) {
+        LLVMValueRef param = LLVMGetParam(func, i);
+
+        int ret = 0;
+        khint_t k = kh_put_str(h, ast->proto->args[i], &ret);
+        kh_value(h, k) = param;
+    }
+
+    // set body (return value)
+    LLVMValueRef body = code_gen_expr(ast->body);
+    if (body == NULL) {
+        log_error("Invalid generated body");
+        LLVMDeleteFunction(func);
+        return NULL;
+    }
+    LLVMBuildRet(builder, body);
+
+    // verify
+    if (LLVMVerifyFunction(func, LLVMPrintMessageAction) == 1) {
+        log_error("invalid function");
+        LLVMDeleteFunction(func);
+        return NULL;
+    }
+
+    return func;
+}
+
+LLVMValueRef code_gen_expr_const(double val) {
+    return LLVMConstReal(LLVMDoubleTypeInContext(context), val);
+}
+
+LLVMValueRef code_gen_expr_var(variable_expr_ast var_expr) {
+    khint_t k = kh_get_str(h, var_expr.name);
+    if (kh_exist(h, k) == 0) {
+        log_error("variable is not found in hash table");
+        return NULL;
+    }
+
+    // get value
+    LLVMValueRef var = kh_val(h, k);
+    if (var == NULL) {
+        log_error("invalid variable data");
+        return NULL;
+    }
+
+    return var;
+}
+
+LLVMValueRef code_gen_expr_bin(binary_expr_ast binary_expr) {
+    switch (binary_expr.op) {
+        case '+':
+            return LLVMBuildFAdd(builder, code_gen_expr(binary_expr.lhs), code_gen_expr(binary_expr.rhs), "addtmp");
+        case '-':
+            return LLVMBuildFSub(builder, code_gen_expr(binary_expr.lhs), code_gen_expr(binary_expr.rhs), "subtmp");
+        case '*':
+            return LLVMBuildMul(builder, code_gen_expr(binary_expr.lhs), code_gen_expr(binary_expr.rhs), "multmp");
+        case '/':
+            return LLVMBuildFDiv(builder, code_gen_expr(binary_expr.lhs), code_gen_expr(binary_expr.rhs), "divtmp");
+        case '<':
+            return LLVMBuildFCmp(builder, LLVMRealULT, code_gen_expr(binary_expr.lhs), code_gen_expr(binary_expr.rhs), "lesstmp");
+        case '>':
+            return LLVMBuildFCmp(builder, LLVMRealUGT, code_gen_expr(binary_expr.lhs), code_gen_expr(binary_expr.rhs), "greatertmp");
+        default:
+            log_error("Op is not supported");
+            return NULL;
+    }
+}
+
+LLVMValueRef code_gen_expr_func_call(call_expr_ast call_expr) {
+    LLVMValueRef func = LLVMGetNamedFunction(module, call_expr.callee);
+    if (func == NULL) {
+        log_error("Unknown function referenced");
+        return NULL;
+    }
+
+    // check parameter size
+    unsigned expected_size = LLVMCountParams(func);
+    if (expected_size != call_expr.args_len) {
+        log_error("Mismatch params count");
+    }
+
+    // type checking is ignore (single double in the language)
+
+    // set args
+    LLVMValueRef args[64];
+    for (int i = 0; i < call_expr.args_len; i++) {
+        args[i] = code_gen_expr(call_expr.args[i]);
+    }
+
+    LLVMTypeRef ret_type = LLVMGetCalledFunctionType(func);
+    return LLVMBuildCall2(builder, ret_type, func, args, call_expr.args_len, "calltmp");
+}
+
+static LLVMValueRef code_gen_expr(expr_ast *expr) {
+    switch (expr->type) {
+        case expr_ast_type_num:
+            return code_gen_expr_const(expr->number_val);
+        case expr_ast_type_var:
+            return code_gen_expr_var(expr->variable);
+        case expr_ast_type_binary:
+            return code_gen_expr_bin(expr->binary_expr);
+        case expr_ast_type_function_call:
+            return code_gen_expr_func_call(expr->call_expr);
+    }
+}
+
+static void code_gen() {
+    // init
+    context = LLVMContextCreate();
+    module = LLVMModuleCreateWithNameInContext("default", context);
+    builder = LLVMCreateBuilderInContext(context);
+
+    // hash table
+    h = kh_init_str();
+
+    // start
+    for (int i = 0; i < gl_root_ast.nodes_len; i++) {
+        top_node node = gl_root_ast.nodes[i];
+        switch (node.type) {
+            case top_node_type_func:
+                code_gen_func(node.function);
+                break;
+            case top_node_type_expr:
+                code_gen_func(node.expr);
+                break;
+            case top_node_type_extern:
+                code_gen_proto(node.extern_proto);
+                break;
+        }
+    }
+}
+
+static void print_ast() {
+    fprintf(stdout, "AST: %d top-level items\n", gl_root_ast.nodes_len);
+
+    for (int  i = 0; i < gl_root_ast.nodes_len; i++) {
+        top_node node = gl_root_ast.nodes[i];
+        switch (node.type) {
+            case top_node_type_func:
+                fprintf(stdout, "- function: %s, size: %d\n", node.function->proto->name, node.function->proto->args_len);
+                break;
+            case top_node_type_expr:
+                fprintf(stdout, "- expr\n");
+                break;
+            case top_node_type_extern:
+                fprintf(stdout, "- extern: %s, size: %d\n", node.extern_proto->name, node.extern_proto->args_len);
+                break;
+        }
+    }
+}
+
 /*
  * entry point
+ * def test1() 3 def test2() 4 test1() extern fib()
  */
 int main() {
+
+//    run_lexer();
+//    return 0;
+
+    // parse the ast
+    log_info("### start parsing");
     parse();
+    log_info("finished parsing");
 
-    fprintf(stdout, "parse result: %d functions, %d externs, %d top level exprs\n", ast_function_idx, ast_extern_idx, ast_expr_idx);
+    print_ast();
 
-    for (int i = 0; i < ast_function_idx; ++i) {
-        fprintf(stdout, "\tfunction: %s\n", gl_root_ast.functions[i]->proto->name);
-    }
 
-    for (int i = 0; i < ast_extern_idx; ++i) {
-        fprintf(stdout, "\texterns: %s\n", gl_root_ast.extern_protos[i]->name);
-    }
+    // code gen
+    log_info("### start code gen\n");
+    code_gen();
+
+    // print
+    printf("%s", LLVMPrintModuleToString(module));
+
+    return 0;
 }

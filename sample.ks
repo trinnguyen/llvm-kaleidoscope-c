@@ -9,7 +9,7 @@ def fib(x)
 # This expression will compute the 40th number.
 fib(40)
 
-# standard library functions
+# standard library function
 extern sin(arg);
 extern cos(arg);
 extern atan2(arg1 arg2);
